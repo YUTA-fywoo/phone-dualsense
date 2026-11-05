@@ -1,0 +1,11 @@
+# 工具链（用 setup-toolchain.sh 下载）
+/toolchain/
+# 编译产物
+/build/
+*.apk
+# 签名密钥：每个人自己生成，不要公开
+/keystore/
+# adb 来自 Google platform-tools，不随仓库分发（连接脚本会自动下载）
+/电脑端/adb/
+# 本地进度记录
+/进度.md

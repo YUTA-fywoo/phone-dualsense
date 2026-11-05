@@ -1,0 +1,6 @@
+*.bat text eol=crlf
+*.sh text eol=lf
+*.java text eol=lf
+*.md text eol=lf
+*.xml text eol=lf
+*.png binary

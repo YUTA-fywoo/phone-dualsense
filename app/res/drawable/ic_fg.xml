@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- 手柄外形 -->
+    <path
+        android:fillColor="#FFF2F5FB"
+        android:pathData="M38,38H70C77,38 81,42 82.5,49L85,64C86.5,71 82,77 76,75C73,74 71,71 69,68L66,64H42L39,68C37,71 35,74 32,75C26,77 21.5,71 23,64L25.5,49C27,42 31,38 38,38Z" />
+    <!-- 触摸板 -->
+    <path
+        android:fillColor="#FFC9D3E6"
+        android:pathData="M47,41.5H61A1.5,1.5 0 0,1 62.5,43V49.5A1.5,1.5 0 0,1 61,51H47A1.5,1.5 0 0,1 45.5,49.5V43A1.5,1.5 0 0,1 47,41.5Z" />
+    <!-- 十字键 -->
+    <path
+        android:fillColor="#FF16233F"
+        android:pathData="M30.5,50.5h10v3h-10z M34,47h3v10h-3z" />
+    <!-- 四个键 -->
+    <path
+        android:fillColor="#FF16233F"
+        android:pathData="M71.1,47.2a1.9,1.9 0 1,0 3.8,0a1.9,1.9 0 1,0 -3.8,0 M75.6,52a1.9,1.9 0 1,0 3.8,0a1.9,1.9 0 1,0 -3.8,0 M71.1,56.8a1.9,1.9 0 1,0 3.8,0a1.9,1.9 0 1,0 -3.8,0 M66.6,52a1.9,1.9 0 1,0 3.8,0a1.9,1.9 0 1,0 -3.8,0" />
+    <!-- 摇杆 -->
+    <path
+        android:fillColor="#FF16233F"
+        android:pathData="M41.6,59.5a3.4,3.4 0 1,0 6.8,0a3.4,3.4 0 1,0 -6.8,0 M59.6,59.5a3.4,3.4 0 1,0 6.8,0a3.4,3.4 0 1,0 -6.8,0" />
+</vector>
