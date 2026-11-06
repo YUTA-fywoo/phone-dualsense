@@ -1,7 +1,9 @@
 package com.phonepad.ds;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.Context;
+import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
@@ -17,6 +19,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.view.KeyEvent;
 import android.view.Surface;
 import android.view.View;
 import android.view.Window;
@@ -27,6 +30,7 @@ import android.widget.Toast;
 
 import com.phonepad.ds.core.DualSense;
 import com.phonepad.ds.core.PadState;
+import com.phonepad.ds.core.TouchLogic;
 import com.phonepad.ds.core.UsbIpServer;
 
 import java.security.SecureRandom;
@@ -37,6 +41,12 @@ public final class MainActivity extends Activity
     /** 手机上的 USB/IP 端口。电脑端 adb forward tcp:32400 tcp:3240。 */
     static final int PORT = 3240;
 
+    private static final int DIALOG_THEME = android.R.style.Theme_DeviceDefault_Dialog_Alert;
+    /** 音量键可以映射成的按键，0 = 不映射（照常调音量）。 */
+    private static final int[] VOL_BITS = {0, PadState.L2, PadState.R2, PadState.L1, PadState.R1, PadState.L3, PadState.R3,
+            PadState.CROSS, PadState.CIRCLE, PadState.SQUARE, PadState.TRIANGLE};
+    private static final String[] VOL_NAMES = {"不映射（照常调音量）", "L2", "R2", "L1", "R1", "L3", "R3", "×", "○", "□", "△"};
+
     private final Handler main = new Handler(Looper.getMainLooper());
     private PadState state;
     private UsbIpServer server;
@@ -46,7 +56,9 @@ public final class MainActivity extends Activity
     private SensorManager sensors;
     private Sensor gyro, accel;
     private DisplayManager displays;
-    private boolean motionOn, vibOn, resumed;
+    private boolean motionOn, vibOn, hapticsOn, resumed;
+    private int volUp, volDown;
+    private boolean volUpHeld, volDownHeld;
     private volatile int rotation = Surface.ROTATION_90;
     private final float[] lastAccel = {0, 0, SensorManager.GRAVITY_EARTH};
     private long lastBack;
@@ -87,6 +99,9 @@ public final class MainActivity extends Activity
         prefs = getSharedPreferences("pad", Context.MODE_PRIVATE);
         motionOn = prefs.getBoolean("motion", true);
         vibOn = prefs.getBoolean("vibration", true);
+        hapticsOn = prefs.getBoolean("haptics", true);
+        volUp = validVol(prefs.getInt("volUp", PadState.L2));
+        volDown = validVol(prefs.getInt("volDown", PadState.R2));
 
         Window w = getWindow();
         w.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
@@ -104,7 +119,8 @@ public final class MainActivity extends Activity
         accel = sensors.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
 
         view = new PadView(this, state, this);
-        view.setToggles(motionOn, gyro != null, vibOn);
+        view.setLayoutAdjustments(prefs.getString("layout", null));
+        updateVolumeHint();
         setContentView(view);
         rumble = new Rumble(this);
 
@@ -133,6 +149,8 @@ public final class MainActivity extends Activity
         resumed = false;
         sensors.unregisterListener(this);
         state.resetMotion();
+        releaseVolumeKeys();
+        view.cancelTouches();
     }
 
     @Override
@@ -148,11 +166,16 @@ public final class MainActivity extends Activity
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
         if (hasFocus) hideSystemBars();
+        else releaseVolumeKeys(); // 弹出对话框等情况下收不到松开事件
     }
 
     @Override
     @SuppressWarnings("deprecation")
     public void onBackPressed() {
+        if (view.isEditing()) {
+            onEditDone();
+            return;
+        }
         long now = SystemClock.uptimeMillis();
         if (now - lastBack < 2000) {
             super.onBackPressed();
@@ -254,28 +277,175 @@ public final class MainActivity extends Activity
     // ================= 界面回调 =================
 
     @Override
-    public void onToggleMotion() {
-        if (gyro == null) {
-            Toast.makeText(this, "这台手机没有陀螺仪，体感用不了", Toast.LENGTH_SHORT).show();
+    public void onHaptic(int kind) {
+        if (!hapticsOn) return;
+        if (kind == TouchLogic.HAPTIC_PRESS) rumble.press();
+        else rumble.tick();
+    }
+
+    @Override
+    public void onLayoutEdited(String serialized) {
+        prefs.edit().putString("layout", serialized).apply();
+    }
+
+    @Override
+    public void onEditDone() {
+        view.setEditing(false);
+        Toast.makeText(this, "布局已保存", Toast.LENGTH_SHORT).show();
+    }
+
+    @Override
+    public void onOpenSettings() {
+        view.cancelTouches();
+        if (isFinishing()) return;
+        String[] items = {
+                "体感：" + (gyro == null ? "这台手机没有陀螺仪" : (motionOn ? "开" : "关")),
+                "游戏震动（电脑发来的）：" + (vibOn ? "开" : "关"),
+                "按键触感：" + (hapticsOn ? "开" : "关"),
+                "音量+ 键：" + volName(volUp),
+                "音量− 键：" + volName(volDown),
+                "调整布局（拖动、双指缩放）",
+                "恢复默认布局",
+                "退出（电脑上的手柄会断开）",
+        };
+        new AlertDialog.Builder(this, DIALOG_THEME)
+                .setTitle("设置")
+                .setItems(items, new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int which) {
+                        onSetting(which);
+                    }
+                })
+                .setNegativeButton("关闭", null)
+                .show();
+    }
+
+    private void onSetting(int which) {
+        switch (which) {
+            case 0:
+                if (gyro == null) {
+                    Toast.makeText(this, "这台手机没有陀螺仪，体感用不了", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+                motionOn = !motionOn;
+                prefs.edit().putBoolean("motion", motionOn).apply();
+                registerSensors();
+                onOpenSettings();
+                break;
+            case 1:
+                vibOn = !vibOn;
+                prefs.edit().putBoolean("vibration", vibOn).apply();
+                if (!vibOn) rumble.stop();
+                onOpenSettings();
+                break;
+            case 2:
+                hapticsOn = !hapticsOn;
+                prefs.edit().putBoolean("haptics", hapticsOn).apply();
+                if (hapticsOn) rumble.press();
+                onOpenSettings();
+                break;
+            case 3:
+            case 4:
+                chooseVolume(which == 3);
+                break;
+            case 5:
+                view.setEditing(true);
+                Toast.makeText(this, "拖动部件移动位置，两根手指捏合缩放，调好点“完成”", Toast.LENGTH_LONG).show();
+                break;
+            case 6:
+                view.resetLayout();
+                Toast.makeText(this, "已恢复默认布局", Toast.LENGTH_SHORT).show();
+                break;
+            default:
+                finish();
+                break;
+        }
+    }
+
+    private void chooseVolume(final boolean up) {
+        int cur = up ? volUp : volDown, sel = 0;
+        for (int i = 0; i < VOL_BITS.length; i++) if (VOL_BITS[i] == cur) sel = i;
+        new AlertDialog.Builder(this, DIALOG_THEME)
+                .setTitle(up ? "音量+ 键当作" : "音量− 键当作")
+                .setSingleChoiceItems(VOL_NAMES, sel, new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int which) {
+                        if (up) volUp = VOL_BITS[which];
+                        else volDown = VOL_BITS[which];
+                        prefs.edit().putInt("volUp", volUp).putInt("volDown", volDown).apply();
+                        releaseVolumeKeys();
+                        updateVolumeHint();
+                        d.dismiss();
+                        onOpenSettings();
+                    }
+                })
+                .setNegativeButton("取消", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int which) {
+                        onOpenSettings();
+                    }
+                })
+                .show();
+    }
+
+    // ================= 音量键当实体按键 =================
+
+    private static int validVol(int bit) {
+        for (int b : VOL_BITS) if (b == bit) return bit;
+        return 0;
+    }
+
+    private static String volName(int bit) {
+        for (int i = 0; i < VOL_BITS.length; i++) if (VOL_BITS[i] == bit) return VOL_NAMES[i];
+        return VOL_NAMES[0];
+    }
+
+    private void updateVolumeHint() {
+        if (volUp == 0 && volDown == 0) {
+            view.setVolumeHint("");
             return;
         }
-        motionOn = !motionOn;
-        prefs.edit().putBoolean("motion", motionOn).apply();
-        view.setToggles(motionOn, true, vibOn);
-        registerSensors();
+        String up = volUp == 0 ? "调音量" : volName(volUp), down = volDown == 0 ? "调音量" : volName(volDown);
+        view.setVolumeHint("手机音量键：音量+ = " + up + "，音量− = " + down);
+    }
+
+    /** 音量键返回映射的按键位，不映射返回 0，不是音量键返回 -1。 */
+    private int volumeBit(int keyCode) {
+        if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) return volUp;
+        if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) return volDown;
+        return -1;
+    }
+
+    private void pushVolumeKeys() {
+        view.setExternalButtons((volUpHeld ? volUp : 0) | (volDownHeld ? volDown : 0));
+    }
+
+    private void releaseVolumeKeys() {
+        if (!volUpHeld && !volDownHeld) return;
+        volUpHeld = volDownHeld = false;
+        pushVolumeKeys();
     }
 
     @Override
-    public void onToggleVibration() {
-        vibOn = !vibOn;
-        prefs.edit().putBoolean("vibration", vibOn).apply();
-        view.setToggles(motionOn, gyro != null, vibOn);
-        if (!vibOn) rumble.stop();
+    public boolean onKeyDown(int keyCode, KeyEvent event) {
+        int bit = volumeBit(keyCode);
+        if (bit <= 0) return super.onKeyDown(keyCode, event);
+        if (event.getRepeatCount() == 0) {
+            if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) volUpHeld = true;
+            else volDownHeld = true;
+            pushVolumeKeys();
+        }
+        return true; // 吃掉，不让系统调音量
     }
 
     @Override
-    public void onButtonsPressed(int newlyPressed) {
-        if (vibOn) rumble.tick();
+    public boolean onKeyUp(int keyCode, KeyEvent event) {
+        int bit = volumeBit(keyCode);
+        if (bit <= 0) return super.onKeyUp(keyCode, event);
+        if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) volUpHeld = false;
+        else volDownHeld = false;
+        pushVolumeKeys();
+        return true;
     }
 
     // ================= USB/IP 回调（在网络线程里） =================

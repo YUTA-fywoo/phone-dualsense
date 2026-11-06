@@ -9,19 +9,25 @@ JDK=toolchain/jdk/bin
 BT=toolchain/sdk/build-tools/35.0.1
 AJAR=toolchain/sdk/platforms/android-35/android.jar
 OUT=build
-VERSION_CODE=1
-VERSION_NAME=1.0
+VERSION_CODE=2
+VERSION_NAME=1.1
 
 for f in "$JDK/javac.exe" "$BT/aapt2.exe" "$BT/lib/d8.jar" "$AJAR"; do
   [ -e "$f" ] || { echo "缺少 $f，先运行 bash setup-toolchain.sh 下载工具链"; exit 1; }
 done
 
-echo "== 协议测试（电脑上模拟 usbip 客户端）"
+echo "== 电脑上的测试（协议：模拟 usbip 客户端；触控：模拟 2400×1080 触屏）"
 rm -rf "$OUT/test" && mkdir -p "$OUT/test"
 "$JDK/javac.exe" -encoding UTF-8 -source 8 -target 8 -Xlint:-options -d "$OUT/test" \
-  app/src/com/phonepad/ds/core/*.java test/ProtocolTest.java test/PcHarness.java
-"$JDK/java.exe" -Dfile.encoding=UTF-8 -cp "$OUT/test" ProtocolTest | tail -n 1
-[ "${PIPESTATUS[0]}" -eq 0 ] || { echo "协议测试没通过，停止打包"; exit 1; }
+  app/src/com/phonepad/ds/core/*.java test/ProtocolTest.java test/PcHarness.java test/TouchTest.java
+for t in ProtocolTest TouchTest; do
+  if ! "$JDK/java.exe" -Dfile.encoding=UTF-8 -cp "$OUT/test" "$t" > "$OUT/test/$t.log" 2>&1; then
+    grep -E "失败|Exception|at " "$OUT/test/$t.log" | head -n 30
+    echo "$t 没通过（完整输出在 $OUT/test/$t.log），停止打包"
+    exit 1
+  fi
+  echo "$t：$(tail -n 1 "$OUT/test/$t.log")"
+done
 [ "${1:-}" = "test" ] && exit 0
 
 echo "== 资源"

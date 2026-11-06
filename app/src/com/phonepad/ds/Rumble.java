@@ -43,11 +43,22 @@ final class Rumble {
         vib.vibrate(VibrationEffect.createOneShot(30_000, a), ATTRS);
     }
 
+    /** 按下按键：清脆的一下。 */
+    void press() {
+        haptic(VibrationEffect.EFFECT_CLICK, 18, 200);
+    }
+
+    /** 抓到摇杆、摇杆推到底：轻的一下。 */
     void tick() {
+        haptic(VibrationEffect.EFFECT_TICK, 10, 110);
+    }
+
+    /** 电脑那边在震动时不发，免得把游戏震动打断。 */
+    private void haptic(int predefined, int fallbackMs, int fallbackAmp) {
         if (vib == null || level != 0) return;
         VibrationEffect e;
-        if (Build.VERSION.SDK_INT >= 29) e = VibrationEffect.createPredefined(VibrationEffect.EFFECT_TICK);
-        else e = VibrationEffect.createOneShot(12, amplitude ? 110 : VibrationEffect.DEFAULT_AMPLITUDE);
+        if (Build.VERSION.SDK_INT >= 29) e = VibrationEffect.createPredefined(predefined);
+        else e = VibrationEffect.createOneShot(fallbackMs, amplitude ? fallbackAmp : VibrationEffect.DEFAULT_AMPLITUDE);
         vib.vibrate(e, ATTRS);
     }
 

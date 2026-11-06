@@ -3,6 +3,7 @@ package com.phonepad.ds;
 import android.content.Context;
 import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.DashPathEffect;
 import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.RadialGradient;
@@ -12,61 +13,50 @@ import android.graphics.Shader;
 import android.graphics.Typeface;
 import android.os.Build;
 import android.os.SystemClock;
-import android.util.SparseArray;
 import android.view.MotionEvent;
 import android.view.View;
 
+import com.phonepad.ds.core.PadLayout;
 import com.phonepad.ds.core.PadState;
+import com.phonepad.ds.core.TouchLogic;
 
 import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 整个屏幕就是手柄正面，布局照 DualSense：左上 L1/L2，右上 R1/R2，左边十字键，右边 △○×□，
- * 中间触摸板，两侧 Create / Options，下方 PS 键和麦克风键，下面两个摇杆。
+ * 整个屏幕就是手柄正面。位置在 {@link PadLayout}，触屏判定在 {@link TouchLogic}，这里只负责
+ * 把触摸事件交给它们、把结果写进 PadState、画界面，以及布局编辑模式。
  */
 public final class PadView extends View {
 
     public interface Callbacks {
-        void onToggleMotion();
+        void onHaptic(int kind);
 
-        void onToggleVibration();
+        void onOpenSettings();
 
-        void onButtonsPressed(int newlyPressed);
-    }
+        void onLayoutEdited(String serialized);
 
-    private static final int K_NONE = 0, K_SHOULDER_L = 1, K_SHOULDER_R = 2, K_FACE = 3, K_DPAD = 4,
-            K_STICK_L = 5, K_STICK_R = 6, K_TOUCHPAD = 7, K_SINGLE = 8;
-
-    private static final class Ptr {
-        int kind;
-        int bit;
-        float x, y, downX, downY, ox, oy;
-        long downTime;
-        boolean moved, stickClick, longPress;
-        int slot = -1, touchId;
-        RectF rect;
+        void onEditDone();
     }
 
     private final PadState state;
     private final Callbacks cb;
-    private final SparseArray<Ptr> ptrs = new SparseArray<>();
+    private final PadLayout L = new PadLayout();
+    private final TouchLogic logic = new TouchLogic(L);
+    private final Runnable timer = new Runnable() {
+        @Override
+        public void run() {
+            apply();
+        }
+    };
 
-    // ---- 布局 ----
     private float W, H, s;
-    private final RectF rL1 = new RectF(), rL2 = new RectF(), rR1 = new RectF(), rR2 = new RectF();
-    private final RectF rPad = new RectF(), rCreate = new RectF(), rOptions = new RectF(), rMic = new RectF();
-    private final RectF rChipMotion = new RectF(), rChipVib = new RectF();
-    private float dpadX, dpadY, dpadR, faceX, faceY, faceOff, btnR;
-    private float lsX, lsY, rsX, rsY, stickR, psX, psY, psR;
 
-    // ---- 交互状态 ----
-    private long lastUpL, lastUpR;
-    private float lastUpLx, lastUpLy, lastUpRx, lastUpRy;
-    private int touchCounter;
-    private long padClickUntil;
-    private int lastButtons;
-    private final float[] knob = new float[4]; // 两个摇杆的偏移 -1..1
+    // ---- 布局编辑 ----
+    private boolean editing;
+    private int editGroup = -1, editPtr = -1, pinchPtr = -1;
+    private float lastX, lastY, pinchD0, pinchS0;
+    private final RectF btnDone = new RectF(), btnReset = new RectF();
 
     // ---- 电脑发来的显示状态 ----
     private boolean connected;
@@ -74,7 +64,7 @@ public final class PadView extends View {
     private int lightbar = 0xFF3A4150;
     private int playerLeds;
     private int micLed;
-    private boolean motionOn = true, motionAvailable = true, vibOn = true;
+    private String volumeHint = "";
 
     // ---- 画笔 ----
     private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -82,6 +72,7 @@ public final class PadView extends View {
     private final Paint text = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Path path = new Path();
     private final Rect tmpRect = new Rect();
+    private final RectF tmpF = new RectF();
     private Paint bgPaint;
 
     private static final int BG = 0xFF101216;
@@ -89,6 +80,7 @@ public final class PadView extends View {
     private static final int BTN_EDGE = 0xFF343944;
     private static final int LABEL = 0xFF9AA3B2;
     private static final int PRESSED = 0xFFE9EDF5;
+    private static final int ACCENT = 0xFF4C7BD9;
     private static final int C_TRIANGLE = 0xFF3FD4B6;
     private static final int C_CIRCLE = 0xFFFF6B78;
     private static final int C_CROSS = 0xFF7DA7FF;
@@ -141,11 +133,48 @@ public final class PadView extends View {
         invalidate();
     }
 
-    public void setToggles(boolean motion, boolean motionAvail, boolean vib) {
-        motionOn = motion;
-        motionAvailable = motionAvail;
-        vibOn = vib;
+    /** 触摸板上显示的音量键说明，空串表示不显示。 */
+    public void setVolumeHint(String hint) {
+        volumeHint = hint == null ? "" : hint;
         invalidate();
+    }
+
+    /** 音量键等实体键映射过来的按键。 */
+    public void setExternalButtons(int bits) {
+        logic.setExternal(bits);
+        apply();
+    }
+
+    public void setLayoutAdjustments(String serialized) {
+        L.deserialize(serialized);
+        if (W > 0) {
+            L.compute(W, H);
+            updateExclusion();
+        }
+        invalidate();
+    }
+
+    public void resetLayout() {
+        L.resetAdjustments();
+        if (W > 0) L.compute(W, H);
+        layoutChanged();
+    }
+
+    public boolean isEditing() {
+        return editing;
+    }
+
+    public void setEditing(boolean on) {
+        editing = on;
+        editGroup = -1;
+        pinchPtr = -1;
+        cancelTouches();
+    }
+
+    /** 松开所有触屏输入（打开设置、进入编辑时用）。 */
+    public void cancelTouches() {
+        logic.cancelAll();
+        apply();
     }
 
     // ================= 布局 =================
@@ -155,333 +184,168 @@ public final class PadView extends View {
         W = w;
         H = h;
         s = Math.min(H, W / 2.0f);
-        float m = 0.045f * s;
-
-        float tpW = Math.min(0.40f * W, 0.98f * s);
-        rPad.set(W / 2 - tpW / 2, 0.04f * H, W / 2 + tpW / 2, 0.42f * H);
-
-        float shW = Math.min(0.40f * s, rPad.left - m - 0.16f * s);
-        rL2.set(m, 0.035f * H, m + shW, 0.035f * H + 0.115f * s);
-        rL1.set(m, rL2.bottom + 0.03f * s, m + shW, rL2.bottom + 0.03f * s + 0.10f * s);
-        rR2.set(W - m - shW, rL2.top, W - m, rL2.bottom);
-        rR1.set(W - m - shW, rL1.top, W - m, rL1.bottom);
-
-        float cx = (rL2.right + rPad.left) / 2, pw = 0.055f * s, ph = 0.11f * s;
-        rCreate.set(cx - pw / 2, 0.10f * H, cx + pw / 2, 0.10f * H + ph);
-        cx = (rR2.left + rPad.right) / 2;
-        rOptions.set(cx - pw / 2, rCreate.top, cx + pw / 2, rCreate.bottom);
-
-        dpadR = 0.19f * s;
-        dpadX = m + 0.06f * s + dpadR;
-        dpadY = Math.max(0.55f * H, rL1.bottom + dpadR + 0.05f * s);
-        faceX = W - dpadX;
-        faceY = dpadY;
-        btnR = 0.072f * s;
-        faceOff = 0.142f * s;
-
-        stickR = 0.175f * s;
-        lsY = H - stickR - 0.07f * s;
-        lsX = Math.max(dpadX + dpadR + stickR * 0.95f, 0.355f * W);
-        lsX = Math.min(lsX, W / 2 - stickR - 0.13f * s);
-        rsX = W - lsX;
-        rsY = lsY;
-
-        psR = 0.058f * s;
-        psX = W / 2;
-        psY = rPad.bottom + 0.075f * s + psR;
-        float mw = 0.10f * s, mh = 0.05f * s;
-        float my = psY + psR + 0.05f * s;
-        rMic.set(W / 2 - mw / 2, my, W / 2 + mw / 2, my + mh);
-
-        float chipW = 0.15f * s, chipH = 0.072f * s, gap = 0.025f * s;
-        float cy = H - 0.04f * s - chipH;
-        rChipMotion.set(W / 2 - gap / 2 - chipW, cy, W / 2 - gap / 2, cy + chipH);
-        rChipVib.set(W / 2 + gap / 2, cy, W / 2 + gap / 2 + chipW, cy + chipH);
+        L.compute(w, h);
 
         bgPaint = new Paint();
         bgPaint.setShader(new RadialGradient(W / 2, H * 0.45f, Math.max(W, H) * 0.7f,
                 0xFF1A1D23, BG, Shader.TileMode.CLAMP));
 
-        if (Build.VERSION.SDK_INT >= 29) {
-            List<Rect> ex = new ArrayList<>();
-            int top = (int) (dpadY - dpadR * 1.3f), bottom = (int) (dpadY + dpadR * 1.3f);
-            ex.add(new Rect(0, top, (int) (dpadX + dpadR), bottom));
-            ex.add(new Rect((int) (faceX - dpadR), top, w, bottom));
-            setSystemGestureExclusionRects(ex);
-        }
+        float bw = 0.24f * s, bh = 0.085f * s, cy = L.pad.cy() + 0.075f * s, gap = 0.03f * s;
+        btnDone.set(W / 2 - gap / 2 - bw, cy - bh / 2, W / 2 - gap / 2, cy + bh / 2);
+        btnReset.set(W / 2 + gap / 2, cy - bh / 2, W / 2 + gap / 2 + bw, cy + bh / 2);
+        updateExclusion();
+    }
+
+    private void updateExclusion() {
+        if (Build.VERSION.SDK_INT < 29 || W <= 0) return;
+        // 两侧边缘滑动会触发系统返回手势，十字键和 △○×□ 附近排除掉
+        List<Rect> ex = new ArrayList<>();
+        float zl = L.dpadZone(), zr = L.faceZone();
+        ex.add(new Rect(0, (int) (L.dpadY - zl), (int) (L.dpadX + L.dpadR), (int) (L.dpadY + zl)));
+        ex.add(new Rect((int) (L.faceX - L.faceOff), (int) (L.faceY - zr), (int) W, (int) (L.faceY + zr)));
+        setSystemGestureExclusionRects(ex);
+    }
+
+    private void layoutChanged() {
+        updateExclusion();
+        cb.onLayoutEdited(L.serialize());
+        invalidate();
     }
 
     // ================= 触摸 =================
 
     @Override
     public boolean onTouchEvent(MotionEvent e) {
-        int action = e.getActionMasked();
+        if (editing) {
+            editTouch(e);
+            return true;
+        }
         long now = SystemClock.uptimeMillis();
-        switch (action) {
+        switch (e.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
             case MotionEvent.ACTION_POINTER_DOWN: {
                 int i = e.getActionIndex();
-                down(e.getPointerId(i), e.getX(i), e.getY(i), now);
+                logic.down(e.getPointerId(i), e.getX(i), e.getY(i), now);
                 break;
             }
             case MotionEvent.ACTION_MOVE:
-                for (int i = 0; i < e.getPointerCount(); i++) {
-                    Ptr p = ptrs.get(e.getPointerId(i));
-                    if (p != null) move(p, e.getX(i), e.getY(i));
-                }
+                for (int i = 0; i < e.getPointerCount(); i++) logic.move(e.getPointerId(i), e.getX(i), e.getY(i));
                 break;
             case MotionEvent.ACTION_UP:
             case MotionEvent.ACTION_POINTER_UP: {
                 int i = e.getActionIndex();
-                up(e.getPointerId(i), now);
+                logic.move(e.getPointerId(i), e.getX(i), e.getY(i));
+                logic.up(e.getPointerId(i), now);
                 break;
             }
             case MotionEvent.ACTION_CANCEL:
-                ptrs.clear();
+                logic.cancelAll();
                 break;
             default:
                 break;
         }
-        recompute();
+        apply();
         return true;
     }
 
-    private void down(int id, float x, float y, long now) {
-        Ptr p = new Ptr();
-        p.x = p.downX = p.ox = x;
-        p.y = p.downY = p.oy = y;
-        p.downTime = now;
-
-        if (grow(rChipMotion, 0.2f).contains(x, y)) {
-            cb.onToggleMotion();
-            return;
-        }
-        if (grow(rChipVib, 0.2f).contains(x, y)) {
-            cb.onToggleVibration();
-            return;
-        }
-        if (shoulderBits(x, y, rL1, rL2, PadState.L1, PadState.L2) != 0) p.kind = K_SHOULDER_L;
-        else if (shoulderBits(x, y, rR1, rR2, PadState.R1, PadState.R2) != 0) p.kind = K_SHOULDER_R;
-        else if (grow(rCreate, 0.9f).contains(x, y)) single(p, PadState.CREATE, rCreate, 0.9f);
-        else if (grow(rOptions, 0.9f).contains(x, y)) single(p, PadState.OPTIONS, rOptions, 0.9f);
-        else if (rPad.contains(x, y)) {
-            int slot = freeSlot();
-            if (slot < 0) return;
-            p.kind = K_TOUCHPAD;
-            p.slot = slot;
-            p.touchId = (touchCounter++) & 0x7F;
-            final int pid = id;
-            final long dt = p.downTime;
-            postDelayed(new Runnable() {
-                @Override
-                public void run() {
-                    Ptr q = ptrs.get(pid);
-                    if (q != null && q.kind == K_TOUCHPAD && q.downTime == dt && !q.moved) {
-                        q.longPress = true; // 按住不动 = 按下触摸板
-                        recompute();
-                    }
-                }
-            }, 500);
-        } else if (dist(x, y, psX, psY) < psR * 1.6f) {
-            RectF r = new RectF(psX - psR, psY - psR, psX + psR, psY + psR);
-            single(p, PadState.PS, r, 0.6f);
-        } else if (grow(rMic, 0.8f).contains(x, y)) single(p, PadState.MUTE, rMic, 0.8f);
-        else if (dist(x, y, dpadX, dpadY) < dpadR * 1.3f) p.kind = K_DPAD;
-        else if (dist(x, y, faceX, faceY) < faceOff + btnR * 1.6f) p.kind = K_FACE;
-        else {
-            float dl = dist(x, y, lsX, lsY), dr = dist(x, y, rsX, rsY);
-            if (dl <= dr && dl < stickR * 1.8f) {
-                p.kind = K_STICK_L;
-                p.stickClick = now - lastUpL < 300 && dist(x, y, lastUpLx, lastUpLy) < stickR * 1.2f;
-            } else if (dr < dl && dr < stickR * 1.8f) {
-                p.kind = K_STICK_R;
-                p.stickClick = now - lastUpR < 300 && dist(x, y, lastUpRx, lastUpRy) < stickR * 1.2f;
-            } else {
-                return;
-            }
-        }
-        ptrs.put(id, p);
-    }
-
-    private void single(Ptr p, int bit, RectF r, float growBy) {
-        p.kind = K_SINGLE;
-        p.bit = bit;
-        p.rect = grow(r, growBy);
-    }
-
-    private void move(Ptr p, float x, float y) {
-        p.x = x;
-        p.y = y;
-        if (p.kind == K_TOUCHPAD && dist(x, y, p.downX, p.downY) > rPad.width() * 0.035f) p.moved = true;
-        if (p.kind == K_STICK_L || p.kind == K_STICK_R) {
-            float dx = x - p.ox, dy = y - p.oy, d = (float) Math.hypot(dx, dy);
-            if (d > stickR) { // 手指拉出范围时原点跟着走，反向推不用先回中
-                p.ox += dx * (d - stickR) / d;
-                p.oy += dy * (d - stickR) / d;
-            }
-        }
-    }
-
-    private void up(int id, long now) {
-        Ptr p = ptrs.get(id);
-        if (p == null) return;
-        ptrs.remove(id);
-        if (p.kind == K_STICK_L) {
-            lastUpL = now;
-            lastUpLx = p.x;
-            lastUpLy = p.y;
-        } else if (p.kind == K_STICK_R) {
-            lastUpR = now;
-            lastUpRx = p.x;
-            lastUpRy = p.y;
-        } else if (p.kind == K_TOUCHPAD && !p.moved && !p.longPress && now - p.downTime < 220) {
-            padClickUntil = now + 110; // 轻点 = 按一下触摸板
-            postDelayed(new Runnable() {
-                @Override
-                public void run() {
-                    recompute();
-                }
-            }, 120);
-        }
-    }
-
-    private int freeSlot() {
-        boolean[] used = new boolean[2];
-        for (int i = 0; i < ptrs.size(); i++) {
-            Ptr q = ptrs.valueAt(i);
-            if (q.kind == K_TOUCHPAD && q.slot >= 0) used[q.slot] = true;
-        }
-        return !used[0] ? 0 : (!used[1] ? 1 : -1);
-    }
-
-    /** 根据所有手指重新算一遍状态，写进 PadState。 */
-    private void recompute() {
-        int b = 0;
-        float lx = 0, ly = 0, rx = 0, ry = 0;
-        boolean[] ta = new boolean[2];
-        int[] tid = new int[2], tx = new int[2], ty = new int[2];
-        for (int i = 0; i < ptrs.size(); i++) {
-            Ptr p = ptrs.valueAt(i);
-            switch (p.kind) {
-                case K_SHOULDER_L:
-                    b |= shoulderBits(p.x, p.y, rL1, rL2, PadState.L1, PadState.L2);
-                    break;
-                case K_SHOULDER_R:
-                    b |= shoulderBits(p.x, p.y, rR1, rR2, PadState.R1, PadState.R2);
-                    break;
-                case K_FACE:
-                    b |= faceBits(p.x, p.y);
-                    break;
-                case K_DPAD:
-                    b |= dpadBits(p.x, p.y);
-                    break;
-                case K_STICK_L:
-                    lx = clampUnit((p.x - p.ox) / stickR);
-                    ly = clampUnit((p.y - p.oy) / stickR);
-                    if (p.stickClick) b |= PadState.L3;
-                    break;
-                case K_STICK_R:
-                    rx = clampUnit((p.x - p.ox) / stickR);
-                    ry = clampUnit((p.y - p.oy) / stickR);
-                    if (p.stickClick) b |= PadState.R3;
-                    break;
-                case K_TOUCHPAD:
-                    ta[p.slot] = true;
-                    tid[p.slot] = p.touchId;
-                    tx[p.slot] = Math.round((p.x - rPad.left) / rPad.width() * 1919f);
-                    ty[p.slot] = Math.round((p.y - rPad.top) / rPad.height() * 1079f);
-                    if (p.longPress) b |= PadState.TOUCHPAD;
-                    break;
-                case K_SINGLE:
-                    if (p.rect.contains(p.x, p.y)) b |= p.bit;
-                    break;
-                default:
-                    break;
-            }
-        }
-        // 摇杆圆形限幅
-        float ml = (float) Math.hypot(lx, ly);
-        if (ml > 1) { lx /= ml; ly /= ml; }
-        float mr = (float) Math.hypot(rx, ry);
-        if (mr > 1) { rx /= mr; ry /= mr; }
-        knob[0] = lx; knob[1] = ly; knob[2] = rx; knob[3] = ry;
-
-        if (SystemClock.uptimeMillis() < padClickUntil) b |= PadState.TOUCHPAD;
-        int l2 = (b & PadState.L2) != 0 ? 255 : 0;
-        int r2 = (b & PadState.R2) != 0 ? 255 : 0;
-        state.setTouchInput(b, axis(lx), axis(ly), axis(rx), axis(ry), l2, r2, ta, tid, tx, ty);
-
-        int pressed = b & ~lastButtons;
-        lastButtons = b;
-        if (pressed != 0) cb.onButtonsPressed(pressed);
+    /** 重新计算输出，写进 PadState，发触感，安排下一次计时。 */
+    private void apply() {
+        long now = SystemClock.uptimeMillis();
+        logic.update(now);
+        TouchLogic.Stick a = logic.sticks[0], b = logic.sticks[1];
+        state.setTouchInput(logic.buttons, axis(a.x), axis(a.y), axis(b.x), axis(b.y), logic.l2(), logic.r2(),
+                logic.tActive, logic.tId, logic.tX, logic.tY);
+        int h = logic.takeHaptic();
+        if (h != TouchLogic.HAPTIC_NONE) cb.onHaptic(h);
+        removeCallbacks(timer);
+        long t = logic.nextTimer(now);
+        if (t >= 0) postDelayed(timer, Math.max(1, t - now));
         invalidate();
+        if (logic.takeGearRequest()) cb.onOpenSettings();
     }
 
     private static int axis(float v) {
         return Math.round(127.5f + v * 127.5f);
     }
 
-    private static float clampUnit(float v) {
-        return v < -1 ? -1 : (v > 1 ? 1 : v);
-    }
-
-    /** r1 是 L1/R1（第二排），r2 是 L2/R2（最上面一排）。手指可以在两排之间滑。 */
-    private int shoulderBits(float x, float y, RectF r1, RectF r2, int bit1, int bit2) {
-        float padY = r1.height() * 0.35f, padX = r1.width() * 0.12f;
-        float left = Math.min(r1.left, r2.left) - padX, right = Math.max(r1.right, r2.right) + padX;
-        float top = r2.top - padY, bottom = r1.bottom + padY;
-        if (x < left || x > right || y < top || y > bottom) return 0;
-        float mid = (r2.bottom + r1.top) / 2;
-        return y < mid ? bit2 : bit1;
-    }
-
-    private int faceBits(float x, float y) {
-        float[][] c = {
-                {faceX, faceY - faceOff, PadState.TRIANGLE},
-                {faceX + faceOff, faceY, PadState.CIRCLE},
-                {faceX, faceY + faceOff, PadState.CROSS},
-                {faceX - faceOff, faceY, PadState.SQUARE},
-        };
-        int best = -1, second = -1;
-        float d1 = Float.MAX_VALUE, d2 = Float.MAX_VALUE;
-        for (int i = 0; i < 4; i++) {
-            float d = dist(x, y, c[i][0], c[i][1]);
-            if (d < d1) {
-                second = best; d2 = d1;
-                best = i; d1 = d;
-            } else if (d < d2) {
-                second = i; d2 = d;
+    private void editTouch(MotionEvent e) {
+        switch (e.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN: {
+                float x = e.getX(), y = e.getY();
+                editGroup = -1;
+                pinchPtr = -1;
+                if (btnDone.contains(x, y)) {
+                    cb.onEditDone();
+                    return;
+                }
+                if (btnReset.contains(x, y)) {
+                    resetLayout();
+                    return;
+                }
+                editGroup = L.groupAt(x, y);
+                editPtr = e.getPointerId(0);
+                lastX = x;
+                lastY = y;
+                break;
             }
+            case MotionEvent.ACTION_POINTER_DOWN: {
+                if (editGroup < 0 || pinchPtr >= 0) break;
+                int i = e.getActionIndex(), j = e.findPointerIndex(editPtr);
+                if (j < 0) break;
+                pinchPtr = e.getPointerId(i);
+                pinchD0 = Math.max(1f, (float) Math.hypot(e.getX(i) - e.getX(j), e.getY(i) - e.getY(j)));
+                pinchS0 = L.scale[editGroup];
+                break;
+            }
+            case MotionEvent.ACTION_MOVE: {
+                if (editGroup < 0) break;
+                int j = e.findPointerIndex(editPtr);
+                if (j < 0) break;
+                if (pinchPtr >= 0) {
+                    int i = e.findPointerIndex(pinchPtr);
+                    if (i >= 0) {
+                        float d = (float) Math.hypot(e.getX(i) - e.getX(j), e.getY(i) - e.getY(j));
+                        L.setScale(editGroup, pinchS0 * d / pinchD0);
+                    }
+                } else {
+                    L.moveGroup(editGroup, e.getX(j) - lastX, e.getY(j) - lastY);
+                    lastX = e.getX(j);
+                    lastY = e.getY(j);
+                }
+                invalidate();
+                break;
+            }
+            case MotionEvent.ACTION_POINTER_UP: {
+                int id = e.getPointerId(e.getActionIndex());
+                if (id == pinchPtr) {
+                    pinchPtr = -1;
+                } else if (id == editPtr) {
+                    if (pinchPtr >= 0) {
+                        editPtr = pinchPtr;
+                        pinchPtr = -1;
+                    } else {
+                        editGroup = -1;
+                        break;
+                    }
+                } else {
+                    break;
+                }
+                int j = e.findPointerIndex(editPtr);
+                if (j >= 0) {
+                    lastX = e.getX(j);
+                    lastY = e.getY(j);
+                }
+                break;
+            }
+            case MotionEvent.ACTION_UP:
+            case MotionEvent.ACTION_CANCEL:
+                if (editGroup >= 0) layoutChanged();
+                editGroup = -1;
+                pinchPtr = -1;
+                break;
+            default:
+                break;
         }
-        if (d1 > btnR * 2.2f) return 0;
-        int bits = (int) c[best][2];
-        // 手指压在两个相邻键中间时两个都按下
-        if (second >= 0 && d2 < d1 * 1.3f && d2 < btnR * 1.75f) bits |= (int) c[second][2];
-        return bits;
-    }
-
-    private int dpadBits(float x, float y) {
-        float dx = x - dpadX, dy = y - dpadY, d = (float) Math.hypot(dx, dy);
-        if (d < dpadR * 0.18f || d > dpadR * 2.2f) return 0;
-        double a = Math.toDegrees(Math.atan2(dy, dx));
-        if (a < 0) a += 360;
-        if (a < 30 || a >= 330) return PadState.RIGHT;
-        if (a < 60) return PadState.RIGHT | PadState.DOWN;
-        if (a < 120) return PadState.DOWN;
-        if (a < 150) return PadState.DOWN | PadState.LEFT;
-        if (a < 210) return PadState.LEFT;
-        if (a < 240) return PadState.LEFT | PadState.UP;
-        if (a < 300) return PadState.UP;
-        return PadState.UP | PadState.RIGHT;
-    }
-
-    private static float dist(float x, float y, float cx, float cy) {
-        return (float) Math.hypot(x - cx, y - cy);
-    }
-
-    private static RectF grow(RectF r, float f) {
-        float gx = r.width() * f / 2, gy = r.height() * f / 2;
-        return new RectF(r.left - gx, r.top - gy, r.right + gx, r.bottom + gy);
     }
 
     // ================= 绘制 =================
@@ -490,125 +354,163 @@ public final class PadView extends View {
     protected void onDraw(Canvas c) {
         if (bgPaint == null) return;
         c.drawRect(0, 0, W, H, bgPaint);
-        int b = lastButtons;
+        int b = logic.buttons;
+        long now = SystemClock.uptimeMillis();
 
-        drawShoulder(c, rL2, "L2", (b & PadState.L2) != 0);
-        drawShoulder(c, rL1, "L1", (b & PadState.L1) != 0);
-        drawShoulder(c, rR2, "R2", (b & PadState.R2) != 0);
-        drawShoulder(c, rR1, "R1", (b & PadState.R1) != 0);
+        drawShoulder(c, L.l2, "L2", (b & PadState.L2) != 0);
+        drawShoulder(c, L.l1, "L1", (b & PadState.L1) != 0);
+        drawShoulder(c, L.r2, "R2", (b & PadState.R2) != 0);
+        drawShoulder(c, L.r1, "R1", (b & PadState.R1) != 0);
 
         drawTouchpad(c, (b & PadState.TOUCHPAD) != 0);
+        drawGear(c, logic.holdProgress(TouchLogic.K_GEAR, 0, now));
         drawCreate(c, (b & PadState.CREATE) != 0);
         drawOptions(c, (b & PadState.OPTIONS) != 0);
-        drawPs(c, (b & PadState.PS) != 0);
-        drawMic(c, (b & PadState.MUTE) != 0);
+        drawPs(c, (b & PadState.PS) != 0, logic.holdProgress(TouchLogic.K_HOLD, PadState.PS, now));
+        drawMic(c, (b & PadState.MUTE) != 0, logic.holdProgress(TouchLogic.K_HOLD, PadState.MUTE, now));
         drawDpad(c, b);
         drawFace(c, b);
-        drawStick(c, lsX, lsY, knob[0], knob[1], (b & PadState.L3) != 0, "L3");
-        drawStick(c, rsX, rsY, knob[2], knob[3], (b & PadState.R3) != 0, "R3");
-        drawStatus(c);
+        drawStick(c, 0, (b & PadState.L3) != 0, "L3");
+        drawStick(c, 1, (b & PadState.R3) != 0, "R3");
+        if (editing) drawEditor(c);
+
+        // 按住类按键的进度圈要动起来
+        float g = logic.holdProgress(TouchLogic.K_GEAR, 0, now);
+        float p1 = logic.holdProgress(TouchLogic.K_HOLD, PadState.PS, now);
+        float p2 = logic.holdProgress(TouchLogic.K_HOLD, PadState.MUTE, now);
+        if ((g >= 0 && g < 1) || (p1 >= 0 && p1 < 1) || (p2 >= 0 && p2 < 1)) postInvalidateOnAnimation();
     }
 
-    private void drawShoulder(Canvas c, RectF r, String label, boolean on) {
-        float rad = r.height() * 0.42f;
+    private void drawShoulder(Canvas c, PadLayout.Box r, String label, boolean on) {
+        tmpF.set(r.l, r.t, r.r, r.b);
+        float rad = r.h() * 0.42f;
         fill.setColor(on ? PRESSED : BTN);
-        c.drawRoundRect(r, rad, rad, fill);
+        c.drawRoundRect(tmpF, rad, rad, fill);
         stroke.setColor(on ? PRESSED : BTN_EDGE);
         stroke.setStrokeWidth(0.006f * s);
-        c.drawRoundRect(r, rad, rad, stroke);
+        c.drawRoundRect(tmpF, rad, rad, stroke);
         text.setColor(on ? BG : LABEL);
-        text.setTextSize(r.height() * 0.42f);
-        drawCentered(c, label, r.centerX(), r.centerY());
+        text.setTextSize(r.h() * 0.42f);
+        drawCentered(c, label, r.cx(), r.cy());
     }
 
     private void drawTouchpad(Canvas c, boolean clicked) {
+        PadLayout.Box p = L.pad;
         float rad = 0.045f * s;
         // 灯条：触摸板左右两侧
         float lw = 0.012f * s, inset = 0.02f * s;
         fill.setColor(lightbar);
         fill.setAlpha(70);
-        c.drawRoundRect(rPad.left - inset - lw * 2.4f, rPad.top + rad, rPad.left - inset + lw * 1.4f, rPad.bottom - rad, lw * 2, lw * 2, fill);
-        c.drawRoundRect(rPad.right + inset - lw * 1.4f, rPad.top + rad, rPad.right + inset + lw * 2.4f, rPad.bottom - rad, lw * 2, lw * 2, fill);
+        c.drawRoundRect(p.l - inset - lw * 2.4f, p.t + rad, p.l - inset + lw * 1.4f, p.b - rad, lw * 2, lw * 2, fill);
+        c.drawRoundRect(p.r + inset - lw * 1.4f, p.t + rad, p.r + inset + lw * 2.4f, p.b - rad, lw * 2, lw * 2, fill);
         fill.setAlpha(255);
-        c.drawRoundRect(rPad.left - inset - lw, rPad.top + rad, rPad.left - inset, rPad.bottom - rad, lw, lw, fill);
-        c.drawRoundRect(rPad.right + inset, rPad.top + rad, rPad.right + inset + lw, rPad.bottom - rad, lw, lw, fill);
+        c.drawRoundRect(p.l - inset - lw, p.t + rad, p.l - inset, p.b - rad, lw, lw, fill);
+        c.drawRoundRect(p.r + inset, p.t + rad, p.r + inset + lw, p.b - rad, lw, lw, fill);
 
+        tmpF.set(p.l, p.t, p.r, p.b);
         fill.setColor(clicked ? 0xFF3A404C : 0xFF1D2027);
-        c.drawRoundRect(rPad, rad, rad, fill);
+        c.drawRoundRect(tmpF, rad, rad, fill);
         stroke.setColor(clicked ? PRESSED : 0xFF30353F);
         stroke.setStrokeWidth(0.006f * s);
-        c.drawRoundRect(rPad, rad, rad, stroke);
+        c.drawRoundRect(tmpF, rad, rad, stroke);
 
-        // 手指位置
-        for (int i = 0; i < ptrs.size(); i++) {
-            Ptr p = ptrs.valueAt(i);
-            if (p.kind != K_TOUCHPAD) continue;
+        for (TouchLogic.Ptr q : logic.pointers()) {
+            if (q.kind != TouchLogic.K_TOUCHPAD) continue;
             fill.setColor(0x55FFFFFF);
-            c.drawCircle(p.x, p.y, 0.05f * s, fill);
+            c.drawCircle(q.x, q.y, 0.05f * s, fill);
         }
-        // 连接状态和提示写在触摸板中间（两摇杆之间放不下）
-        String line;
-        int dot;
-        if (error != null) {
-            line = error;
-            dot = 0xFFFF6B6B;
-        } else if (connected) {
-            line = "已连接电脑";
-            dot = 0xFF4CD964;
-        } else {
-            line = "等待电脑连接";
-            dot = 0xFF8A93A3;
+
+        if (!editing) {
+            String line;
+            int dot;
+            if (error != null) {
+                line = error;
+                dot = 0xFFFF6B6B;
+            } else if (connected) {
+                line = "已连接电脑";
+                dot = 0xFF4CD964;
+            } else {
+                line = "等待电脑连接";
+                dot = 0xFF8A93A3;
+            }
+            float cy = p.t + 0.065f * s, lh = 0.042f * s;
+            text.setTextSize(0.04f * s);
+            text.setColor(0xFFB8C0CC);
+            float tw = Math.min(text.measureText(line), p.w() * 0.8f);
+            fill.setColor(dot);
+            c.drawCircle(p.cx() - tw / 2 - 0.03f * s, cy, 0.013f * s, fill);
+            drawCentered(c, line, p.cx(), cy);
+            text.setTextSize(0.027f * s);
+            text.setColor(0xFF5D6472);
+            cy += 0.06f * s;
+            drawCentered(c, connected ? "滑动 = 触摸板，轻点 = 按下触摸板" : "在电脑上运行“连接手柄.bat”", p.cx(), cy);
+            drawCentered(c, "两边空白处都是摇杆，手指落在哪里哪里就是中心", p.cx(), cy + lh);
+            drawCentered(c, "双击摇杆区并按住 = L3/R3，PS 和麦克风键要按住", p.cx(), cy + lh * 2);
+            if (!volumeHint.isEmpty()) drawCentered(c, volumeHint, p.cx(), cy + lh * 3);
         }
-        float cy = rPad.centerY() - 0.06f * s;
-        text.setTextSize(0.04f * s);
-        text.setColor(0xFFB8C0CC);
-        float tw = Math.min(text.measureText(line), rPad.width() * 0.8f);
-        fill.setColor(dot);
-        c.drawCircle(rPad.centerX() - tw / 2 - 0.03f * s, cy, 0.013f * s, fill);
-        drawCentered(c, line, rPad.centerX(), cy);
-        text.setTextSize(0.03f * s);
-        text.setColor(0xFF5D6472);
-        drawCentered(c, connected ? "滑动 = 触摸板   轻点 = 按下触摸板" : "在电脑上运行“连接手柄.bat”",
-                rPad.centerX(), cy + 0.065f * s);
-        drawCentered(c, "双击摇杆并按住 = L3 / R3", rPad.centerX(), cy + 0.115f * s);
 
         // 玩家指示灯：触摸板下沿 5 个点
-        float dy = rPad.bottom - 0.035f * s, gap = 0.04f * s, r = 0.009f * s;
+        float dy = p.b - 0.03f * s, gap = 0.04f * s, r = 0.009f * s;
         for (int i = 0; i < 5; i++) {
             boolean lit = (playerLeds & (1 << i)) != 0;
             fill.setColor(lit ? 0xFFF4F7FF : 0xFF2A2E36);
-            c.drawCircle(rPad.centerX() + (i - 2) * gap, dy, r, fill);
+            c.drawCircle(p.cx() + (i - 2) * gap, dy, r, fill);
         }
     }
 
+    private void drawGear(Canvas c, float progress) {
+        if (editing) return;
+        float cx = L.gear.cx(), cy = L.gear.cy(), r = L.gear.w() / 2;
+        boolean on = progress >= 0;
+        stroke.setColor(on ? PRESSED : 0xFF4A505C);
+        stroke.setStrokeWidth(0.007f * s);
+        c.drawCircle(cx, cy, r * 0.32f, stroke);
+        for (int i = 0; i < 8; i++) {
+            double a = Math.PI / 4 * i;
+            float cs = (float) Math.cos(a), sn = (float) Math.sin(a);
+            c.drawLine(cx + cs * r * 0.5f, cy + sn * r * 0.5f, cx + cs * r * 0.72f, cy + sn * r * 0.72f, stroke);
+        }
+        if (on) drawProgress(c, cx, cy, r * 1.05f, progress);
+    }
+
+    private void drawProgress(Canvas c, float cx, float cy, float r, float progress) {
+        stroke.setColor(ACCENT);
+        stroke.setStrokeWidth(0.008f * s);
+        tmpF.set(cx - r, cy - r, cx + r, cy + r);
+        c.drawArc(tmpF, -90, 360 * progress, false, stroke);
+    }
+
     private void drawCreate(Canvas c, boolean on) {
-        drawPill(c, rCreate, on);
+        PadLayout.Box r = L.create;
+        drawPill(c, r, on);
         stroke.setColor(on ? BG : LABEL);
         stroke.setStrokeWidth(0.008f * s);
-        float cx = rCreate.centerX(), cy = rCreate.centerY(), h = rCreate.height() * 0.16f;
+        float cx = r.cx(), cy = r.cy(), h = r.h() * 0.16f;
         // Create 键：三道向上散开的短线，下端不相交，免得看成箭头
         c.drawLine(cx, cy + h * 0.5f, cx, cy - h * 1.0f, stroke);
         c.drawLine(cx - h * 0.45f, cy + h * 0.7f, cx - h * 1.25f, cy - h * 0.5f, stroke);
         c.drawLine(cx + h * 0.45f, cy + h * 0.7f, cx + h * 1.25f, cy - h * 0.5f, stroke);
-        label(c, "CREATE", cx, rCreate.bottom + 0.035f * s);
+        label(c, "CREATE", cx, r.b + 0.035f * s);
     }
 
     private void drawOptions(Canvas c, boolean on) {
-        drawPill(c, rOptions, on);
+        PadLayout.Box r = L.options;
+        drawPill(c, r, on);
         stroke.setColor(on ? BG : LABEL);
         stroke.setStrokeWidth(0.008f * s);
-        float cx = rOptions.centerX(), cy = rOptions.centerY(), w = rOptions.width() * 0.26f, g = rOptions.height() * 0.13f;
+        float cx = r.cx(), cy = r.cy(), w = r.w() * 0.26f, g = r.h() * 0.13f;
         for (int i = -1; i <= 1; i++) c.drawLine(cx - w, cy + i * g, cx + w, cy + i * g, stroke);
-        label(c, "OPTIONS", cx, rOptions.bottom + 0.035f * s);
+        label(c, "OPTIONS", cx, r.b + 0.035f * s);
     }
 
-    private void drawPill(Canvas c, RectF r, boolean on) {
-        float rad = Math.min(r.width(), r.height()) / 2;
+    private void drawPill(Canvas c, PadLayout.Box r, boolean on) {
+        tmpF.set(r.l, r.t, r.r, r.b);
+        float rad = Math.min(r.w(), r.h()) / 2;
         fill.setColor(on ? PRESSED : BTN);
-        c.drawRoundRect(r, rad, rad, fill);
+        c.drawRoundRect(tmpF, rad, rad, fill);
         stroke.setColor(on ? PRESSED : BTN_EDGE);
         stroke.setStrokeWidth(0.005f * s);
-        c.drawRoundRect(r, rad, rad, stroke);
+        c.drawRoundRect(tmpF, rad, rad, stroke);
     }
 
     private void label(Canvas c, String t, float x, float y) {
@@ -617,43 +519,47 @@ public final class PadView extends View {
         c.drawText(t, x, y, text);
     }
 
-    private void drawPs(Canvas c, boolean on) {
+    private void drawPs(Canvas c, boolean on, float progress) {
         fill.setColor(on ? PRESSED : BTN);
-        c.drawCircle(psX, psY, psR, fill);
+        c.drawCircle(L.psX, L.psY, L.psR, fill);
         stroke.setColor(on ? PRESSED : BTN_EDGE);
         stroke.setStrokeWidth(0.006f * s);
-        c.drawCircle(psX, psY, psR, stroke);
+        c.drawCircle(L.psX, L.psY, L.psR, stroke);
         text.setColor(on ? BG : 0xFFC9D0DC);
-        text.setTextSize(psR * 0.72f);
-        drawCentered(c, "PS", psX, psY);
+        text.setTextSize(L.psR * 0.72f);
+        drawCentered(c, "PS", L.psX, L.psY);
+        if (progress >= 0 && !on) drawProgress(c, L.psX, L.psY, L.psR * 1.25f, progress);
     }
 
-    private void drawMic(Canvas c, boolean on) {
+    private void drawMic(Canvas c, boolean on, float progress) {
+        PadLayout.Box r = L.mic;
         boolean led = micLed != 0;
-        float rad = rMic.height() / 2;
+        tmpF.set(r.l, r.t, r.r, r.b);
+        float rad = r.h() / 2;
         fill.setColor(on ? PRESSED : (led ? 0xFFFF8A3D : BTN));
-        c.drawRoundRect(rMic, rad, rad, fill);
+        c.drawRoundRect(tmpF, rad, rad, fill);
         stroke.setColor(on ? BG : (led ? BG : LABEL));
         stroke.setStrokeWidth(0.005f * s);
-        float cx = rMic.centerX(), cy = rMic.centerY(), h = rMic.height() * 0.2f;
+        float cx = r.cx(), cy = r.cy(), h = r.h() * 0.2f;
         // 话筒：胶囊形头部 + 下方 U 形托架 + 短柄
-        RectF head = new RectF(cx - h * 0.55f, cy - h * 1.6f, cx + h * 0.55f, cy + h * 0.2f);
-        c.drawRoundRect(head, h * 0.55f, h * 0.55f, stroke);
-        RectF arc = new RectF(cx - h * 1.05f, cy - h * 1.2f, cx + h * 1.05f, cy + h * 0.75f);
-        c.drawArc(arc, 0, 180, false, stroke);
+        tmpF.set(cx - h * 0.55f, cy - h * 1.6f, cx + h * 0.55f, cy + h * 0.2f);
+        c.drawRoundRect(tmpF, h * 0.55f, h * 0.55f, stroke);
+        tmpF.set(cx - h * 1.05f, cy - h * 1.2f, cx + h * 1.05f, cy + h * 0.75f);
+        c.drawArc(tmpF, 0, 180, false, stroke);
         c.drawLine(cx, cy + h * 0.75f, cx, cy + h * 1.4f, stroke);
+        if (progress >= 0 && !on) drawProgress(c, cx, cy, r.w() * 0.7f, progress);
     }
 
     private void drawDpad(Canvas c, int b) {
         int[] bits = {PadState.UP, PadState.RIGHT, PadState.DOWN, PadState.LEFT};
-        float w = dpadR * 0.62f, len = dpadR * 0.78f, inner = dpadR * 0.2f;
+        float R = L.dpadR, x0 = L.dpadX, y0 = L.dpadY;
+        float w = R * 0.62f, len = R * 0.78f, inner = R * 0.2f;
         for (int i = 0; i < 4; i++) {
             boolean on = (b & bits[i]) != 0;
             c.save();
-            c.rotate(90 * i, dpadX, dpadY);
+            c.rotate(90 * i, x0, y0);
             // 朝中心带尖的方块（PS 风格的分体十字键）
             path.reset();
-            float x0 = dpadX, y0 = dpadY;
             float top = y0 - inner - len, base = y0 - inner - w * 0.32f, rr = w * 0.2f;
             path.moveTo(x0 - w / 2, top + rr);
             path.quadTo(x0 - w / 2, top, x0 - w / 2 + rr, top);
@@ -668,7 +574,6 @@ public final class PadView extends View {
             stroke.setColor(on ? PRESSED : BTN_EDGE);
             stroke.setStrokeWidth(0.006f * s);
             c.drawPath(path, stroke);
-            // 小三角
             float ty = top + len * 0.38f, ts = w * 0.17f;
             path.reset();
             path.moveTo(x0, ty - ts);
@@ -682,13 +587,15 @@ public final class PadView extends View {
     }
 
     private void drawFace(Canvas c, int b) {
-        drawFaceButton(c, faceX, faceY - faceOff, 0, C_TRIANGLE, (b & PadState.TRIANGLE) != 0);
-        drawFaceButton(c, faceX + faceOff, faceY, 1, C_CIRCLE, (b & PadState.CIRCLE) != 0);
-        drawFaceButton(c, faceX, faceY + faceOff, 2, C_CROSS, (b & PadState.CROSS) != 0);
-        drawFaceButton(c, faceX - faceOff, faceY, 3, C_SQUARE, (b & PadState.SQUARE) != 0);
+        float x = L.faceX, y = L.faceY, o = L.faceOff;
+        drawFaceButton(c, x, y - o, 0, C_TRIANGLE, (b & PadState.TRIANGLE) != 0);
+        drawFaceButton(c, x + o, y, 1, C_CIRCLE, (b & PadState.CIRCLE) != 0);
+        drawFaceButton(c, x, y + o, 2, C_CROSS, (b & PadState.CROSS) != 0);
+        drawFaceButton(c, x - o, y, 3, C_SQUARE, (b & PadState.SQUARE) != 0);
     }
 
     private void drawFaceButton(Canvas c, float x, float y, int kind, int color, boolean on) {
+        float btnR = L.btnR;
         fill.setColor(on ? color : BTN);
         c.drawCircle(x, y, btnR, fill);
         stroke.setColor(on ? color : BTN_EDGE);
@@ -719,14 +626,26 @@ public final class PadView extends View {
         }
     }
 
-    private void drawStick(Canvas c, float x, float y, float kx, float ky, boolean click, String name) {
+    /** 没人碰时画在默认位置；手指按住时底座跟到手指落下的地方，原位置留一个淡影。 */
+    private void drawStick(Canvas c, int side, boolean click, String name) {
+        TouchLogic.Stick st = logic.sticks[side];
+        float restX = side == 0 ? L.lsX : L.rsX, restY = side == 0 ? L.lsY : L.rsY;
+        float R = L.stickRadius(side), reach = L.stickReach(side);
+        float x = restX, y = restY;
+        if (st.owner != null && !editing) {
+            x = st.owner.ox;
+            y = st.owner.oy;
+            stroke.setColor(0xFF22262D);
+            stroke.setStrokeWidth(0.006f * s);
+            c.drawCircle(restX, restY, R, stroke);
+        }
         fill.setColor(0xFF181B21);
-        c.drawCircle(x, y, stickR, fill);
-        stroke.setColor(0xFF2C3038);
+        c.drawCircle(x, y, R, fill);
+        stroke.setColor(st.owner != null ? 0xFF3A4352 : 0xFF2C3038);
         stroke.setStrokeWidth(0.01f * s);
-        c.drawCircle(x, y, stickR, stroke);
-        float travel = stickR * 0.42f, kr = stickR * 0.55f;
-        float px = x + kx * travel, py = y + ky * travel;
+        c.drawCircle(x, y, R, stroke);
+        float kr = R * 0.55f;
+        float px = x + st.x * reach, py = y + st.y * reach;
         fill.setColor(click ? PRESSED : 0xFF30353F);
         c.drawCircle(px, py, kr, fill);
         stroke.setColor(click ? PRESSED : 0xFF454B57);
@@ -737,19 +656,72 @@ public final class PadView extends View {
         drawCentered(c, name, px, py);
     }
 
-    private void drawStatus(Canvas c) {
-        drawChip(c, rChipMotion, motionAvailable ? (motionOn ? "体感 开" : "体感 关") : "无陀螺仪", motionOn && motionAvailable);
-        drawChip(c, rChipVib, vibOn ? "震动 开" : "震动 关", vibOn);
+    private final Paint dash = new Paint(Paint.ANTI_ALIAS_FLAG);
+
+    private void drawEditor(Canvas c) {
+        fill.setColor(0x66000000);
+        c.drawRect(0, 0, W, H, fill);
+        dash.setStyle(Paint.Style.STROKE);
+        dash.setStrokeWidth(0.006f * s);
+        dash.setPathEffect(new DashPathEffect(new float[]{0.03f * s, 0.02f * s}, 0));
+        for (int g = 0; g < PadLayout.GROUPS; g++) {
+            boolean sel = g == editGroup;
+            dash.setColor(sel ? ACCENT : 0xFF8A93A3);
+            float cx, cy;
+            switch (g) {
+                case PadLayout.G_L_SHOULDER:
+                case PadLayout.G_R_SHOULDER: {
+                    PadLayout.Box up = g == PadLayout.G_L_SHOULDER ? L.l2 : L.r2;
+                    PadLayout.Box lo = g == PadLayout.G_L_SHOULDER ? L.l1 : L.r1;
+                    float pd = 0.02f * s;
+                    tmpF.set(up.l - pd, up.t - pd, up.r + pd, lo.b + pd);
+                    c.drawRoundRect(tmpF, pd * 2, pd * 2, dash);
+                    cx = tmpF.centerX();
+                    cy = tmpF.bottom + 0.04f * s;
+                    break;
+                }
+                case PadLayout.G_DPAD:
+                    c.drawCircle(L.dpadX, L.dpadY, L.dpadR * 1.1f, dash);
+                    cx = L.dpadX;
+                    cy = L.dpadY + L.dpadR * 1.1f + 0.04f * s;
+                    break;
+                case PadLayout.G_FACE: {
+                    float r = L.faceOff + L.btnR * 1.3f;
+                    c.drawCircle(L.faceX, L.faceY, r, dash);
+                    cx = L.faceX;
+                    cy = L.faceY + r + 0.04f * s;
+                    break;
+                }
+                default: {
+                    int side = g == PadLayout.G_L_STICK ? 0 : 1;
+                    float r = L.stickRadius(side) * 1.1f;
+                    cx = side == 0 ? L.lsX : L.rsX;
+                    c.drawCircle(cx, side == 0 ? L.lsY : L.rsY, r, dash);
+                    cy = (side == 0 ? L.lsY : L.rsY) - r - 0.02f * s;
+                    break;
+                }
+            }
+            text.setColor(sel ? 0xFFD6E2FF : 0xFFB8C0CC);
+            text.setTextSize(0.03f * s);
+            String t = PadLayout.GROUP_NAMES[g] + "  " + Math.round(L.scale[g] * 100) + "%";
+            drawCentered(c, t, cx, Math.min(cy, H - 0.03f * s));
+        }
+
+        text.setColor(0xFFD6E2FF);
+        text.setTextSize(0.034f * s);
+        drawCentered(c, "拖动部件移动位置，两根手指捏合缩放", L.pad.cx(), L.pad.t + 0.07f * s);
+        text.setTextSize(0.028f * s);
+        text.setColor(0xFF8A93A3);
+        drawCentered(c, "摇杆缩放会同时改变推满需要的距离", L.pad.cx(), L.pad.t + 0.12f * s);
+        drawButton(c, btnDone, "完成", true);
+        drawButton(c, btnReset, "恢复默认", false);
     }
 
-    private void drawChip(Canvas c, RectF r, String t, boolean on) {
+    private void drawButton(Canvas c, RectF r, String t, boolean primary) {
         float rad = r.height() / 2;
-        fill.setColor(on ? 0xFF233047 : 0xFF1C1F25);
+        fill.setColor(primary ? ACCENT : 0xFF2A2F38);
         c.drawRoundRect(r, rad, rad, fill);
-        stroke.setColor(on ? 0xFF4C7BD9 : 0xFF2E333C);
-        stroke.setStrokeWidth(0.005f * s);
-        c.drawRoundRect(r, rad, rad, stroke);
-        text.setColor(on ? 0xFFD6E2FF : 0xFF6B7380);
+        text.setColor(0xFFF4F7FF);
         text.setTextSize(r.height() * 0.42f);
         drawCentered(c, t, r.centerX(), r.centerY());
     }
