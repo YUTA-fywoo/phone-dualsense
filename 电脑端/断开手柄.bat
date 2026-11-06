@@ -24,4 +24,4 @@ if not defined ADB goto done
 "%ADB%" forward --remove tcp:32400 >nul 2>&1
 :done
 echo 已断开虚拟手柄。
-timeout /t 3
+"%SystemRoot%\System32\timeout.exe" /t 3

@@ -6,6 +6,8 @@ cd /d "%~dp0"
 set "APK=%~dp0..\手机手柄.apk"
 set "PKG=com.phonepad.ds"
 set "LOCALPORT=32400"
+rem 手机手柄.apk 的版本号（versionCode），build.sh 打包时会自动改。手机上的版本比它旧就升级
+set "APKVER=2"
 
 rem ---- 找 usbip.exe ----
 set "USBIP=%ProgramFiles%\USBip\usbip.exe"
@@ -51,7 +53,27 @@ echo       手机要打开“USB 调试”；第一次连这台电脑时，手�
 if errorlevel 1 goto fail
 
 "%ADB%" -d shell pm path %PKG% 2>nul | findstr /b "package:" >nul
+if errorlevel 1 goto fresh_install
+
+rem ---- 已经装了：读出手机上的版本号，比这个包里的旧就升级。读不出来就照常用手机上的 ----
+set "HAVEVER="
+set "VERTMP=%TEMP%\phonepad-version.txt"
+"%ADB%" -d shell dumpsys package %PKG% 2>nul | findstr /c:"versionCode=" > "%VERTMP%"
+for /f "usebackq tokens=2 delims== " %%V in ("%VERTMP%") do if not defined HAVEVER set "HAVEVER=%%V"
+del /q "%VERTMP%" >nul 2>&1
+if not defined HAVEVER goto installed
+if not exist "%APK%" goto installed
+if %HAVEVER% GEQ %APKVER% goto installed
+echo [2/4] 手机上的“手机手柄”是旧版（版本号 %HAVEVER%），升级到这个包里的版本（版本号 %APKVER%）……
+echo       小米/红米手机会弹出“是否允许通过 USB 安装”，在倒计时结束前点“继续安装”。
+"%ADB%" -d install -r "%APK%"
 if not errorlevel 1 goto installed
+echo       升级没成功，这次先用手机上的旧版连接。
+echo       想升级的话，再运行一次本脚本并在手机上点“继续安装”，或者把 手机手柄.apk 拷到手机上手动安装。
+echo       如果上面提示 INSTALL_FAILED_UPDATE_INCOMPATIBLE，是签名不一样，要先在手机上卸载旧版。
+goto installed
+
+:fresh_install
 echo [2/4] 手机上还没装“手机手柄”，现在安装……
 echo       小米/红米手机会弹出“是否允许通过 USB 安装”，在倒计时结束前点“继续安装”。
 if not exist "%APK%" (
@@ -84,7 +106,7 @@ goto attach
 echo.
 echo 已接入。电脑上会出现“DualSense Wireless Controller”，Steam 里显示为 PS5 手柄。
 echo 用完直接关掉手机 App，或者运行“断开手柄.bat”。
-timeout /t 8
+"%SystemRoot%\System32\timeout.exe" /t 8
 exit /b 0
 
 :adb_failed

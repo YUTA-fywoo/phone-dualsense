@@ -30,6 +30,11 @@ for t in ProtocolTest TouchTest; do
 done
 [ "${1:-}" = "test" ] && exit 0
 
+# 连接脚本靠这个版本号判断手机上的 App 要不要升级。-b：Git Bash 的 sed 默认会把 CRLF 改成 LF
+BAT=电脑端/连接手柄.bat
+sed -b -i "s/^set \"APKVER=[0-9]*\"/set \"APKVER=$VERSION_CODE\"/" "$BAT"
+grep -q "^set \"APKVER=$VERSION_CODE\"" "$BAT" || { echo "$BAT 里没找到 APKVER，停止打包"; exit 1; }
+
 echo "== 资源"
 rm -rf "$OUT/apk" && mkdir -p "$OUT/apk/gen" "$OUT/apk/classes" "$OUT/apk/dex"
 "$BT/aapt2.exe" compile --dir app/res -o "$OUT/apk/res.zip"
